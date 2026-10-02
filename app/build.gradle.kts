@@ -12,11 +12,24 @@ android {
         applicationId = "com.example.stepcounter"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = (System.getenv("GITHUB_RUN_NUMBER") ?: "1").toInt()
+        versionName = "1.${System.getenv("GITHUB_RUN_NUMBER") ?: "0"}"
+    }
+
+    // Σταθερό κλειδί, ώστε κάθε νέα έκδοση να εγκαθίσταται πάνω στην παλιά.
+    signingConfigs {
+        create("shared") {
+            storeFile = file("stepcounter.keystore")
+            storePassword = "stepcounter"
+            keyAlias = "stepcounter"
+            keyPassword = "stepcounter"
+        }
     }
 
     buildTypes {
+        debug {
+            signingConfig = signingConfigs.getByName("shared")
+        }
         release {
             isMinifyEnabled = false
         }
