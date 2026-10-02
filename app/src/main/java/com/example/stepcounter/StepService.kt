@@ -36,6 +36,11 @@ class StepService : Service(), SensorEventListener {
     private var wakeLock: PowerManager.WakeLock? = null
     private var lastNotifyMs = 0L
 
+    /** Όταν η οθόνη της εφαρμογής είναι ανοιχτή, θέλουμε άμεση ενημέρωση. */
+    private var live = false
+    /** Βήματα από τον ανιχνευτή που ο μετρητής δεν έχει αναφέρει ακόμα. */
+    private var pendingDetector = 0
+
     private val accelDetector = AccelStepDetector { publish(store.addSteps(1)) }
 
     override fun onCreate() {
@@ -50,9 +55,13 @@ class StepService : Service(), SensorEventListener {
             stopSelf()
             return START_NOT_STICKY
         }
+        when (intent?.action) {
+            ACTION_LIVE_ON -> live = true
+            ACTION_LIVE_OFF -> live = false
+        }
         goForeground(store.todaySteps)
         startSensors()
-        StepRepo.steps.value = store.todaySteps
+        StepRepo.steps.value = store.todaySteps + pendingDetector
         // Αν το σύστημα σκοτώσει την υπηρεσία, να την ξαναξεκινήσει.
         return START_STICKY
     }
@@ -71,11 +80,24 @@ class StepService : Service(), SensorEventListener {
         sensorManager.unregisterListener(this)
         val stepSensor = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_COUNTER)
         if (stepSensor != null) {
-            // Το τσιπ μετράει μόνο του. Αφήνουμε το σύστημα να μαζεύει τα
-            // βήματα και να μας τα δίνει ανά λίγα δευτερόλεπτα (λιγότερη μπαταρία).
+            releaseWakeLock()
+            // Το τσιπ μετράει μόνο του. Με την εφαρμογή κλειστή αφήνουμε το
+            // σύστημα να μαζεύει τα βήματα και να τα δίνει ανά λίγα δευτερόλεπτα
+            // (λιγότερη μπαταρία). Με την εφαρμογή ανοιχτή τα θέλουμε αμέσως.
             sensorManager.registerListener(
-                this, stepSensor, SensorManager.SENSOR_DELAY_NORMAL, BATCH_LATENCY_US
+                this, stepSensor, SensorManager.SENSOR_DELAY_NORMAL,
+                if (live) 0 else BATCH_LATENCY_US
             )
+            // Ο ανιχνευτής βημάτων αναφέρει κάθε βήμα σχεδόν αμέσως. Τον
+            // χρησιμοποιούμε για ζωντανή ένδειξη, και για να μη χαθούν τα
+            // βήματα πριν έρθει η πρώτη τιμή του μετρητή.
+            val detector = sensorManager.getDefaultSensor(Sensor.TYPE_STEP_DETECTOR)
+            if (detector != null && (live || !store.hasCounterBaseline)) {
+                sensorManager.registerListener(this, detector, SensorManager.SENSOR_DELAY_FASTEST, 0)
+            } else {
+                pendingDetector = 0
+            }
+            sensorManager.flush(this)
         } else {
             val accel = sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER) ?: return
             // Χωρίς τσιπ βημάτων πρέπει ο επεξεργαστής να μένει ξύπνιος
@@ -91,7 +113,15 @@ class StepService : Service(), SensorEventListener {
 
     override fun onSensorChanged(event: SensorEvent) {
         when (event.sensor.type) {
-            Sensor.TYPE_STEP_COUNTER -> publish(store.onCounterValue(event.values[0].toLong()))
+            Sensor.TYPE_STEP_COUNTER -> {
+                val total = store.onCounterValue(event.values[0].toLong(), pendingDetector)
+                pendingDetector = 0
+                publish(total)
+            }
+            Sensor.TYPE_STEP_DETECTOR -> {
+                pendingDetector++
+                publish(store.todaySteps + pendingDetector)
+            }
             Sensor.TYPE_ACCELEROMETER -> accelDetector.onSample(
                 event.values[0], event.values[1], event.values[2], event.timestamp
             )
@@ -138,10 +168,14 @@ class StepService : Service(), SensorEventListener {
         getSystemService(NotificationManager::class.java).createNotificationChannel(channel)
     }
 
-    override fun onDestroy() {
-        sensorManager.unregisterListener(this)
+    private fun releaseWakeLock() {
         wakeLock?.let { if (it.isHeld) it.release() }
         wakeLock = null
+    }
+
+    override fun onDestroy() {
+        sensorManager.unregisterListener(this)
+        releaseWakeLock()
         super.onDestroy()
     }
 
@@ -151,10 +185,23 @@ class StepService : Service(), SensorEventListener {
         private const val CHANNEL_ID = "steps"
         private const val NOTIF_ID = 1
         private const val BATCH_LATENCY_US = 5_000_000 // 5 δευτερόλεπτα
+        private const val ACTION_LIVE_ON = "live_on"
+        private const val ACTION_LIVE_OFF = "live_off"
 
-        fun start(context: Context) {
+        fun start(context: Context, live: Boolean? = null) {
             if (!hasActivityPermission(context)) return
-            ContextCompat.startForegroundService(context, Intent(context, StepService::class.java))
+            val i = Intent(context, StepService::class.java)
+            when (live) {
+                true -> i.action = ACTION_LIVE_ON
+                false -> i.action = ACTION_LIVE_OFF
+                null -> {}
+            }
+            if (live == false) {
+                // Η υπηρεσία τρέχει ήδη: απλώς της λέμε να γυρίσει σε οικονομία.
+                runCatching { context.startService(i) }
+            } else {
+                ContextCompat.startForegroundService(context, i)
+            }
         }
 
         fun stop(context: Context) {
